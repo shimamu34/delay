@@ -35,6 +35,14 @@
       <select id="cameraSelect"></select>
     </label>
 
+    <label>解像度
+      <select id="resolutionSelect">
+        <option value="640x480">SD (640x480)</option>
+        <option value="1280x720" selected>HD (1280x720)</option>
+        <option value="1920x1080">Full HD (1920x1080)</option>
+      </select>
+    </label>
+
     <label>遅延 <strong><span id="dsec">5</span>s</strong>
       <input id="delay" type="range" min="0" max="30" step="1" value="5" />
     </label>
@@ -69,6 +77,7 @@ let recordedChunks = [];
 
 let selectedDeviceId = null;
 let currentStream = null;
+let selectedResolution = { width: 1280, height: 720 };
 
 // ===== DOM =====
 const video = document.getElementById('video');
@@ -85,6 +94,7 @@ const saveBtn = document.getElementById('save');
 const countdown = document.getElementById('countdown');
 const status = document.getElementById('status');
 const cameraSelect = document.getElementById('cameraSelect');
+const resolutionSelect = document.getElementById('resolutionSelect');
 
 // ===== カメラ一覧取得 =====
 async function setupCameraList() {
@@ -96,15 +106,41 @@ async function setupCameraList() {
     const videos = devices.filter(d => d.kind === 'videoinput');
 
     cameraSelect.innerHTML = '';
+    
+    // 背面カメラ(environment)を探す
+    let backCamera = null;
+    
     videos.forEach((d, i) => {
       const opt = document.createElement('option');
       opt.value = d.deviceId;
-      opt.textContent = d.label || `カメラ ${i + 1}`;
+      
+      // ラベルから背面カメラを判定
+      const label = d.label.toLowerCase();
+      const isBack = label.includes('back') || label.includes('rear') || label.includes('environment');
+      const isFront = label.includes('front') || label.includes('user') || label.includes('face');
+      
+      let displayName = d.label || `カメラ ${i + 1}`;
+      if (isBack) displayName += ' (背面)';
+      if (isFront) displayName += ' (前面)';
+      
+      opt.textContent = displayName;
       cameraSelect.appendChild(opt);
+      
+      // 背面カメラを優先的に選択
+      if (isBack && !backCamera) {
+        backCamera = d.deviceId;
+      }
     });
 
     if (videos.length) {
-      selectedDeviceId = videos[0].deviceId;
+      // 背面カメラがあればそれを、なければ最初のカメラを選択
+      selectedDeviceId = backCamera || videos[0].deviceId;
+      
+      // 背面カメラを選択状態にする
+      if (backCamera) {
+        cameraSelect.value = backCamera;
+      }
+      
       status.textContent = `${videos.length}台のカメラが見つかりました`;
     } else {
       status.textContent = 'カメラが見つかりません';
@@ -122,6 +158,15 @@ cameraSelect.onchange = async () => {
     await restartCamera();
   } else {
     selectedDeviceId = newDeviceId;
+  }
+};
+
+resolutionSelect.onchange = () => {
+  const [width, height] = resolutionSelect.value.split('x').map(Number);
+  selectedResolution = { width, height };
+  
+  if (running) {
+    restartCamera();
   }
 };
 
@@ -161,15 +206,24 @@ stopBtn.onclick = () => {
 // ===== カメラ起動 =====
 async function startCamera() {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
-        width:{ideal:1280},
-        height:{ideal:720},
-        frameRate:{ideal:targetFPS}
-      },
-      audio:false
-    });
+    const constraints = {
+      audio: false,
+      video: selectedDeviceId 
+        ? {
+            deviceId: { exact: selectedDeviceId },
+            width: { ideal: selectedResolution.width },
+            height: { ideal: selectedResolution.height },
+            frameRate: { ideal: targetFPS }
+          }
+        : {
+            facingMode: { ideal: 'environment' }, // 背面カメラを優先
+            width: { ideal: selectedResolution.width },
+            height: { ideal: selectedResolution.height },
+            frameRate: { ideal: targetFPS }
+          }
+    };
+
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
 
     currentStream = stream;
     video.srcObject = stream;
@@ -177,6 +231,8 @@ async function startCamera() {
 
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
+    
+    status.textContent = `録画中 (${video.videoWidth}x${video.videoHeight})`;
   } catch (err) {
     status.textContent = 'カメラ起動エラー';
     console.error(err);
@@ -257,18 +313,9 @@ saveBtn.onclick = () => {
   recorder.ondataavailable = e => recordedChunks.push(e.data);
   recorder.onstop = () => {
     const blob = new Blob(recordedChunks, { type:'video/webm' });
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const day = String(now.getDate()).padStart(2, '0');
-    const hour = String(now.getHours()).padStart(2, '0');
-    const min = String(now.getMinutes()).padStart(2, '0');
-    const sec = String(now.getSeconds()).padStart(2, '0');
-    const filename = `${year}_${month}_${day}_${hour}${min}${sec}.webm`;
-    
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = filename;
+    a.download = `delay_${Date.now()}.webm`;
     a.click();
     saveBtn.disabled = false;
   };
