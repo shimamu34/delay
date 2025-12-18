@@ -240,7 +240,13 @@ async function startCamera() {
 }
 
 async function restartCamera() {
-  stopCamera();
+  // ストリームだけ停止、UIは維持
+  if (currentStream) {
+    currentStream.getTracks().forEach(track => track.stop());
+    currentStream = null;
+  }
+  video.srcObject = null;
+  
   frameBuffer = [];
   await startCamera();
   running = true;
