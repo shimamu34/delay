@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>web遅延ツール</title>
+
+<style>
+  :root { --bg:#000; --fg:#fff; --ui:#1f2937; --accent:#22c55e; }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--fg); height:100%; }
+  #wrap { display:flex; flex-direction:column; height:100%; }
+  #view { flex:1; display:flex; align-items:center; justify-content:center; overflow:hidden; background:#000; position:relative; }
+  canvas { max-width:100%; max-height:100%; }
+  #panel { background:rgba(31,41,55,.9); padding:8px 10px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:14px; }
+  label { display:flex; align-items:center; gap:6px; }
+  input[type=range] { min-width:120px; }
+  button { background:#111827; color:#fff; border:1px solid #374151; padding:6px 10px; border-radius:6px; }
+  button.accent { border-color:var(--accent); color:var(--accent); }
+  select { background:#111827; color:#fff; border:1px solid #374151; border-radius:6px; padding:4px; }
+  #countdown { position:absolute; top:10px; right:10px; font-size:32px; font-weight:bold; color:red; text-shadow:0 0 4px #000; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="view">
+    <canvas id="canvas"></canvas>
+    <div id="countdown"></div>
+  </div>
+
+  <div id="panel">
+    <!-- ★ 追加：カメラ選択UI（これだけ） -->
+    <label>カメラ
+      <select id="cameraSelect"></select>
+    </label>
+
+    <label>遅延 <strong><span id="dsec">5</span>s</strong>
+      <input id="delay" type="range" min="0" max="30" step="1" value="5" />
+    </label>
+
+    <label>FPS <strong><span id="fpsv">15</span></strong>
+      <input id="fps" type="range" min="10" max="30" step="1" value="15" />
+    </label>
+
+    <button id="fs">全画面</button>
+    <button id="save">10秒保存</button>
+    <button id="start" class="accent">開始</button>
+  </div>
+</div>
+
+<video id="video" playsinline muted style="display:none"></video>
+
+<script>
+// ===== 状態 =====
+let delaySeconds = 5;
+let delayMs = 5000;
+let targetFPS = 15;
+let running = false;
+
+let frameBuffer = [];
+let lastDraw = 0;
+
+let saving = false;
+let saveStart = 0;
+let recorder;
+let recordedChunks = [];
+
+let selectedDeviceId = null; // ★ 追加
+
+// ===== DOM =====
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const delayInput = document.getElementById('delay');
+const fpsInput = document.getElementById('fps');
+const dsec = document.getElementById('dsec');
+const fpsv = document.getElementById('fpsv');
+const fsBtn = document.getElementById('fs');
+const startBtn = document.getElementById('start');
+const saveBtn = document.getElementById('save');
+const countdown = document.getElementById('countdown');
+const cameraSelect = document.getElementById('cameraSelect');
+
+// ===== カメラ一覧取得（★追加）=====
+async function setupCameraList() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const videos = devices.filter(d => d.kind === 'videoinput');
+
+  cameraSelect.innerHTML = '';
+  videos.forEach((d, i) => {
+    const opt = document.createElement('option');
+    opt.value = d.deviceId;
+    opt.textContent = d.label || `カメラ ${i + 1}`;
+    cameraSelect.appendChild(opt);
+  });
+
+  if (videos.length) selectedDeviceId = videos[0].deviceId;
+}
+
+cameraSelect.onchange = () => {
+  selectedDeviceId = cameraSelect.value;
+};
+
+// ===== UI =====
+delayInput.oninput = () => {
+  delaySeconds = Number(delayInput.value);
+  delayMs = delaySeconds * 1000;
+  dsec.textContent = delaySeconds;
+};
+
+fpsInput.oninput = () => {
+  targetFPS = Number(fpsInput.value);
+  fpsv.textContent = targetFPS;
+};
+
+fsBtn.onclick = () => {
+  if (!document.fullscreenElement) canvas.requestFullscreen();
+  else document.exitFullscreen();
+};
+
+startBtn.onclick = async () => {
+  if (running) return;
+  await startCamera();
+  running = true;
+  lastDraw = performance.now();
+  requestAnimationFrame(loop);
+};
+
+// ===== カメラ起動 =====
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
+      width:{ideal:1280},
+      height:{ideal:720},
+      frameRate:{ideal:targetFPS}
+    },
+    audio:false
+  });
+
+  video.srcObject = stream;
+  await video.play();
+
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+}
+
+// ===== メインループ =====
+function loop(now) {
+  if (!running) return;
+  const interval = 1000 / targetFPS;
+
+  if (now - lastDraw >= interval) {
+    lastDraw = now;
+
+    const bmp = document.createElement('canvas');
+    bmp.width = canvas.width;
+    bmp.height = canvas.height;
+    bmp.getContext('2d').drawImage(video, 0, 0, bmp.width, bmp.height);
+
+    frameBuffer.push({ time: now, bmp });
+
+    let frame = null;
+    while (frameBuffer.length && now - frameBuffer[0].time >= delayMs) {
+      frame = frameBuffer.shift();
+    }
+
+    if (frame) ctx.drawImage(frame.bmp, 0, 0, canvas.width, canvas.height);
+
+    const maxFrames = targetFPS * delaySeconds * 2;
+    if (frameBuffer.length > maxFrames) {
+      frameBuffer.splice(0, frameBuffer.length - maxFrames);
+    }
+
+    if (saving) {
+      const remain = 10 - (now - saveStart) / 1000;
+      countdown.textContent = remain > 0 ? Math.ceil(remain) : '';
+      if (remain <= 0) stopSave();
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+// ===== 保存 =====
+saveBtn.onclick = () => {
+  recordedChunks = [];
+  saving = true;
+  saveStart = performance.now();
+
+  const stream = canvas.captureStream(targetFPS);
+  recorder = new MediaRecorder(stream, { mimeType:'video/webm' });
+  recorder.ondataavailable = e => recordedChunks.push(e.data);
+  recorder.onstop = () => {
+    const blob = new Blob(recordedChunks, { type:'video/webm' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'delay.webm';
+    a.click();
+  };
+  recorder.start();
+};
+
+function stopSave() {
+  saving = false;
+  countdown.textContent = '';
+  recorder.stop();
+}
+
+// 初期化
+fpsv.textContent = targetFPS;
+dsec.textContent = delaySeconds;
+setupCameraList(); // ★ 追加
+</script>
+</body>
+</html>
