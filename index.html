@@ -14,10 +14,12 @@
   #panel { background:rgba(31,41,55,.9); padding:8px 10px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:14px; }
   label { display:flex; align-items:center; gap:6px; }
   input[type=range] { min-width:120px; }
-  button { background:#111827; color:#fff; border:1px solid #374151; padding:6px 10px; border-radius:6px; }
+  button { background:#111827; color:#fff; border:1px solid #374151; padding:6px 10px; border-radius:6px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
   button.accent { border-color:var(--accent); color:var(--accent); }
   select { background:#111827; color:#fff; border:1px solid #374151; border-radius:6px; padding:4px; }
   #countdown { position:absolute; top:10px; right:10px; font-size:32px; font-weight:bold; color:red; text-shadow:0 0 4px #000; }
+  #status { position:absolute; top:10px; left:10px; font-size:14px; background:rgba(0,0,0,.7); padding:4px 8px; border-radius:4px; }
 </style>
 </head>
 <body>
@@ -25,10 +27,10 @@
   <div id="view">
     <canvas id="canvas"></canvas>
     <div id="countdown"></div>
+    <div id="status"></div>
   </div>
 
   <div id="panel">
-    <!-- ★ 追加：カメラ選択UI（これだけ） -->
     <label>カメラ
       <select id="cameraSelect"></select>
     </label>
@@ -42,8 +44,9 @@
     </label>
 
     <button id="fs">全画面</button>
-    <button id="save">10秒保存</button>
+    <button id="save" disabled>10秒保存</button>
     <button id="start" class="accent">開始</button>
+    <button id="stop" style="display:none">停止</button>
   </div>
 </div>
 
@@ -64,7 +67,8 @@ let saveStart = 0;
 let recorder;
 let recordedChunks = [];
 
-let selectedDeviceId = null; // ★ 追加
+let selectedDeviceId = null;
+let currentStream = null;
 
 // ===== DOM =====
 const video = document.getElementById('video');
@@ -76,28 +80,49 @@ const dsec = document.getElementById('dsec');
 const fpsv = document.getElementById('fpsv');
 const fsBtn = document.getElementById('fs');
 const startBtn = document.getElementById('start');
+const stopBtn = document.getElementById('stop');
 const saveBtn = document.getElementById('save');
 const countdown = document.getElementById('countdown');
+const status = document.getElementById('status');
 const cameraSelect = document.getElementById('cameraSelect');
 
-// ===== カメラ一覧取得（★追加）=====
+// ===== カメラ一覧取得 =====
 async function setupCameraList() {
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  const videos = devices.filter(d => d.kind === 'videoinput');
+  try {
+    // まず権限を取得
+    await navigator.mediaDevices.getUserMedia({ video: true });
+    
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const videos = devices.filter(d => d.kind === 'videoinput');
 
-  cameraSelect.innerHTML = '';
-  videos.forEach((d, i) => {
-    const opt = document.createElement('option');
-    opt.value = d.deviceId;
-    opt.textContent = d.label || `カメラ ${i + 1}`;
-    cameraSelect.appendChild(opt);
-  });
+    cameraSelect.innerHTML = '';
+    videos.forEach((d, i) => {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || `カメラ ${i + 1}`;
+      cameraSelect.appendChild(opt);
+    });
 
-  if (videos.length) selectedDeviceId = videos[0].deviceId;
+    if (videos.length) {
+      selectedDeviceId = videos[0].deviceId;
+      status.textContent = `${videos.length}台のカメラが見つかりました`;
+    } else {
+      status.textContent = 'カメラが見つかりません';
+    }
+  } catch (err) {
+    status.textContent = 'カメラアクセス権限が必要です';
+    console.error(err);
+  }
 }
 
-cameraSelect.onchange = () => {
-  selectedDeviceId = cameraSelect.value;
+cameraSelect.onchange = async () => {
+  const newDeviceId = cameraSelect.value;
+  if (running && newDeviceId !== selectedDeviceId) {
+    selectedDeviceId = newDeviceId;
+    await restartCamera();
+  } else {
+    selectedDeviceId = newDeviceId;
+  }
 };
 
 // ===== UI =====
@@ -122,26 +147,64 @@ startBtn.onclick = async () => {
   await startCamera();
   running = true;
   lastDraw = performance.now();
+  startBtn.style.display = 'none';
+  stopBtn.style.display = 'inline-block';
+  saveBtn.disabled = false;
+  status.textContent = '録画中';
   requestAnimationFrame(loop);
+};
+
+stopBtn.onclick = () => {
+  stopCamera();
 };
 
 // ===== カメラ起動 =====
 async function startCamera() {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: {
-      deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
-      width:{ideal:1280},
-      height:{ideal:720},
-      frameRate:{ideal:targetFPS}
-    },
-    audio:false
-  });
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
+        width:{ideal:1280},
+        height:{ideal:720},
+        frameRate:{ideal:targetFPS}
+      },
+      audio:false
+    });
 
-  video.srcObject = stream;
-  await video.play();
+    currentStream = stream;
+    video.srcObject = stream;
+    await video.play();
 
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+  } catch (err) {
+    status.textContent = 'カメラ起動エラー';
+    console.error(err);
+  }
+}
+
+async function restartCamera() {
+  stopCamera();
+  frameBuffer = [];
+  await startCamera();
+  running = true;
+  lastDraw = performance.now();
+  requestAnimationFrame(loop);
+}
+
+function stopCamera() {
+  running = false;
+  if (currentStream) {
+    currentStream.getTracks().forEach(track => track.stop());
+    currentStream = null;
+  }
+  video.srcObject = null;
+  startBtn.style.display = 'inline-block';
+  stopBtn.style.display = 'none';
+  saveBtn.disabled = true;
+  status.textContent = '停止';
+  
+  if (saving) stopSave();
 }
 
 // ===== メインループ =====
@@ -182,19 +245,32 @@ function loop(now) {
 
 // ===== 保存 =====
 saveBtn.onclick = () => {
+  if (!running || saving) return;
+  
   recordedChunks = [];
   saving = true;
   saveStart = performance.now();
+  saveBtn.disabled = true;
 
   const stream = canvas.captureStream(targetFPS);
   recorder = new MediaRecorder(stream, { mimeType:'video/webm' });
   recorder.ondataavailable = e => recordedChunks.push(e.data);
   recorder.onstop = () => {
     const blob = new Blob(recordedChunks, { type:'video/webm' });
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hour = String(now.getHours()).padStart(2, '0');
+    const min = String(now.getMinutes()).padStart(2, '0');
+    const sec = String(now.getSeconds()).padStart(2, '0');
+    const filename = `${year}_${month}_${day}_${hour}${min}${sec}.webm`;
+    
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'delay.webm';
+    a.download = filename;
     a.click();
+    saveBtn.disabled = false;
   };
   recorder.start();
 };
@@ -202,13 +278,15 @@ saveBtn.onclick = () => {
 function stopSave() {
   saving = false;
   countdown.textContent = '';
-  recorder.stop();
+  if (recorder && recorder.state !== 'inactive') {
+    recorder.stop();
+  }
 }
 
 // 初期化
 fpsv.textContent = targetFPS;
 dsec.textContent = delaySeconds;
-setupCameraList(); // ★ 追加
+setupCameraList();
 </script>
 </body>
 </html>
